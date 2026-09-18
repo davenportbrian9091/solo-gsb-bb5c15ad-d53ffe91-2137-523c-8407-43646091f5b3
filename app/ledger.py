@@ -6,7 +6,7 @@ import json
 import sqlite3
 from bisect import bisect_right
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Tuple, Union
 
 from fastapi import HTTPException
 
@@ -24,6 +24,8 @@ from .schemas import (
     EventChangesOut,
     EventIn,
     EventOut,
+    EventPreviewIn,
+    EventPreviewOut,
     LeaderboardChangeOut,
     LeaderboardChangesOut,
     LeaderboardEntry,
@@ -322,9 +324,14 @@ def _effective_rows(conn: sqlite3.Connection, revision: int) -> list[sqlite3.Row
 
 
 def _aggregate(
-    rows: list[sqlite3.Row],
+    rows: list[Union[sqlite3.Row, Mapping]],
 ) -> Tuple[list[Tuple[str, int]], dict[str, list[EffectiveEvent]]]:
-    """Per-participant totals ordered by (-total_points, participant_id)."""
+    """Per-participant totals ordered by (-total_points, participant_id).
+
+    ``rows`` may be sqlite rows or plain mappings — anything supporting
+    ``row["column"]`` for event_id/participant_id/points/revision/
+    correction_of (the scenario preview passes projected draft dicts).
+    """
     totals: dict[str, int] = {}
     details: dict[str, list[EffectiveEvent]] = {}
     for r in rows:
@@ -342,6 +349,61 @@ def _aggregate(
     return ordered, details
 
 
+def _leaderboard_out(
+    revision: int,
+    ordered: list[Tuple[str, int]],
+    details: dict[str, list[EffectiveEvent]],
+) -> LeaderboardOut:
+    """Full leaderboard over an ordered aggregate, ranks starting at 1."""
+    entries = [
+        LeaderboardEntry(
+            rank=i + 1,
+            participant_id=pid,
+            total_points=total,
+            effective_events=details[pid],
+        )
+        for i, (pid, total) in enumerate(ordered)
+    ]
+    return LeaderboardOut(revision=revision, entries=entries)
+
+
+def _rank_positions(
+    ordered: list[Tuple[str, int]],
+) -> dict[str, RankPosition]:
+    """``{participant_id: (rank, total_points)}`` for an ordered aggregate."""
+    return {
+        pid: RankPosition(rank=i + 1, total_points=total)
+        for i, (pid, total) in enumerate(ordered)
+    }
+
+
+def _diff_snapshots(
+    before_map: dict[str, RankPosition],
+    after_map: dict[str, RankPosition],
+) -> list[LeaderboardChangeOut]:
+    """Participants whose rank or total differs between two snapshots.
+
+    Only changed participants are reported, ordered by participant_id; an
+    absent side counts as 0 points for ``points_delta``.
+    """
+    changes: list[LeaderboardChangeOut] = []
+    for pid in sorted(set(before_map) | set(after_map)):
+        before = before_map.get(pid)
+        after = after_map.get(pid)
+        before_total = before.total_points if before is not None else 0
+        after_total = after.total_points if after is not None else 0
+        if before != after:  # rank or total_points changed (covers entry/exit)
+            changes.append(
+                LeaderboardChangeOut(
+                    participant_id=pid,
+                    before=before,
+                    after=after,
+                    points_delta=after_total - before_total,
+                )
+            )
+    return changes
+
+
 def leaderboard(revision: Optional[int] = None) -> LeaderboardOut:
     """Leaderboard as of ``revision`` (default: latest).
 
@@ -354,16 +416,7 @@ def leaderboard(revision: Optional[int] = None) -> LeaderboardOut:
         rows = _effective_rows(conn, revision)
 
     ordered, details = _aggregate(rows)
-    entries = [
-        LeaderboardEntry(
-            rank=i + 1,
-            participant_id=pid,
-            total_points=total,
-            effective_events=details[pid],
-        )
-        for i, (pid, total) in enumerate(ordered)
-    ]
-    return LeaderboardOut(revision=revision, entries=entries)
+    return _leaderboard_out(revision, ordered, details)
 
 
 def _snapshot(conn: sqlite3.Connection, revision: int) -> dict[str, RankPosition]:
@@ -378,10 +431,7 @@ def _snapshot(conn: sqlite3.Connection, revision: int) -> dict[str, RankPosition
     if revision == 0:
         return {}
     ordered, _details = _aggregate(_effective_rows(conn, revision))
-    return {
-        pid: RankPosition(rank=i + 1, total_points=total)
-        for i, (pid, total) in enumerate(ordered)
-    }
+    return _rank_positions(ordered)
 
 
 def leaderboard_changes(
@@ -413,25 +463,10 @@ def leaderboard_changes(
         before_map = _snapshot(conn, from_revision)
         after_map = _snapshot(conn, to_revision)
 
-    changes: list[LeaderboardChangeOut] = []
-    for pid in sorted(set(before_map) | set(after_map)):
-        before = before_map.get(pid)
-        after = after_map.get(pid)
-        before_total = before.total_points if before is not None else 0
-        after_total = after.total_points if after is not None else 0
-        if before != after:  # rank or total_points changed (covers entry/exit)
-            changes.append(
-                LeaderboardChangeOut(
-                    participant_id=pid,
-                    before=before,
-                    after=after,
-                    points_delta=after_total - before_total,
-                )
-            )
     return LeaderboardChangesOut(
         from_revision=from_revision,
         to_revision=to_revision,
-        changes=changes,
+        changes=_diff_snapshots(before_map, after_map),
     )
 
 
@@ -905,3 +940,140 @@ def rewards_preview(preview: RewardPreviewIn) -> RewardPreviewOut:
                 )
         i = j
     return RewardPreviewOut(revision=revision, winners=winners)
+
+
+def events_preview(preview: EventPreviewIn) -> EventPreviewOut:
+    """Read-only what-if projection of draft events on top of a base revision.
+
+    The baseline is the ledger as of ``base_revision`` (0 denotes the empty
+    ledger); later ledger events are ignored by the projection. The drafts
+    then take effect in array order, exactly as if they were appended at the
+    virtual revisions ``base_revision + 1 .. base_revision + len(drafts)``:
+    a draft correcting a baseline event or an earlier draft supersedes its
+    target, and a forked chain keeps every effective leaf — the same
+    effective rule, (-total_points, participant_id) ordering and sequential
+    ranking as ``/leaderboard``.
+
+    ``correction_of`` may reference an event visible in the baseline or an
+    earlier draft of the same batch; anything else (unknown id, later draft,
+    self-reference, or a ledger event beyond ``base_revision``) is a 422. A
+    draft ``event_id`` already stored *anywhere* in the ledger is a 409 —
+    previews have no idempotent replay. A ``base_revision`` beyond the
+    current maximum is a 404. Pure dry run: nothing is written and no
+    revision is consumed.
+    """
+    drafts = preview.events
+    base = preview.base_revision
+
+    # Cheap self-checks; the schema normally rejects these before the call.
+    if not drafts or len(drafts) > 100:
+        raise HTTPException(status_code=422, detail="events must contain 1–100 drafts")
+    seen_ids: set[str] = set()
+    for ev in drafts:
+        if ev.event_id in seen_ids:
+            raise HTTPException(
+                status_code=422,
+                detail=f"event_id '{ev.event_id}' appears more than once in the batch",
+            )
+        seen_ids.add(ev.event_id)
+        if ev.correction_of is not None and ev.correction_of == ev.event_id:
+            raise HTTPException(
+                status_code=422, detail="correction_of must not equal event_id"
+            )
+
+    with read_tx() as conn:
+        max_rev = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM events"
+        ).fetchone()[0]
+        if base > max_rev:
+            raise HTTPException(
+                status_code=404, detail=f"revision {base} not found"
+            )
+
+        # Conflict check first (mirrors /events/batch): a draft id stored
+        # anywhere in the ledger — at any revision — clashes, regardless of
+        # the payload.
+        clash = conn.execute(
+            "SELECT event_id FROM events WHERE event_id IN (%s) LIMIT 1"
+            % ",".join("?" for _ in drafts),
+            [ev.event_id for ev in drafts],
+        ).fetchone()
+        if clash is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"event_id '{clash['event_id']}' already exists in the ledger",
+            )
+
+        baseline_rows = conn.execute(
+            "SELECT event_id, participant_id, points, correction_of, revision"
+            " FROM events WHERE revision <= ? ORDER BY revision ASC",
+            (base,),
+        ).fetchall()
+        before_map = _snapshot(conn, base)
+
+    # Every correction_of must resolve against the baseline or an earlier
+    # draft; referencing a later draft (or an id unknown to both) is a 422.
+    baseline_ids = {r["event_id"] for r in baseline_rows}
+    index_by_id = {ev.event_id: i for i, ev in enumerate(drafts)}
+    for i, ev in enumerate(drafts):
+        if ev.correction_of is None:
+            continue
+        target_idx = index_by_id.get(ev.correction_of)
+        if target_idx is not None:
+            if target_idx >= i:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"event '{ev.event_id}' has correction_of "
+                        f"'{ev.correction_of}' referencing a later event "
+                        "in the same batch; only earlier events may be "
+                        "referenced"
+                    ),
+                )
+        elif ev.correction_of not in baseline_ids:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "correction_of references unknown event "
+                    f"'{ev.correction_of}'"
+                ),
+            )
+
+    # Project: baseline events plus the drafts at virtual revisions, then
+    # apply the ledger's effective rule — an event counts iff nothing in the
+    # combined set corrects it.
+    combined: list[dict] = [
+        {
+            "event_id": r["event_id"],
+            "participant_id": r["participant_id"],
+            "points": r["points"],
+            "correction_of": r["correction_of"],
+            "revision": r["revision"],
+        }
+        for r in baseline_rows
+    ]
+    for i, ev in enumerate(drafts):
+        combined.append(
+            {
+                "event_id": ev.event_id,
+                "participant_id": ev.participant_id,
+                "points": ev.points,
+                "correction_of": ev.correction_of,
+                "revision": base + i + 1,
+            }
+        )
+    superseded = {
+        e["correction_of"] for e in combined if e["correction_of"] is not None
+    }
+    effective = [e for e in combined if e["event_id"] not in superseded]
+    effective.sort(key=lambda e: (e["participant_id"], e["revision"]))
+
+    ordered, details = _aggregate(effective)
+    projected = _leaderboard_out(base + len(drafts), ordered, details)
+    after_map = _rank_positions(ordered)
+
+    return EventPreviewOut(
+        base_revision=base,
+        projected_leaderboard=projected,
+        changes=_diff_snapshots(before_map, after_map),
+    )

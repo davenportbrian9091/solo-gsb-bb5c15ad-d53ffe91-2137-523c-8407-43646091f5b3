@@ -13,6 +13,8 @@ from .schemas import (
     EventChangesOut,
     EventIn,
     EventOut,
+    EventPreviewIn,
+    EventPreviewOut,
     LeaderboardChangesOut,
     LeaderboardOut,
     LeaderboardPageOut,
@@ -93,6 +95,27 @@ def post_events_batch(batch: EventBatchIn, response: Response) -> List[EventOut]
     if not created:
         response.status_code = status.HTTP_200_OK
     return events
+
+
+# NOTE: no POST /events/{event_id} route exists, so this literal path is
+# never shadowed.
+@app.post(
+    "/events/preview",
+    response_model=EventPreviewOut,
+    responses={
+        404: {"description": "base_revision beyond the current maximum"},
+        409: {"description": "A draft event_id already exists in the ledger"},
+        422: {
+            "description": (
+                "Batch size outside 1–100, duplicate event_id within the "
+                "batch, self-reference, or a correction_of pointing at an "
+                "unknown event or a later draft of the same batch"
+            )
+        },
+    },
+)
+def post_events_preview(preview: EventPreviewIn) -> EventPreviewOut:
+    return ledger.events_preview(preview)
 
 
 @app.get("/events", response_model=List[EventOut])

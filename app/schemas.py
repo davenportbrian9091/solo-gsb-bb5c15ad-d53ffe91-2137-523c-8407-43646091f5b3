@@ -39,6 +39,37 @@ class EventBatchIn(RootModel[List[EventIn]]):
         return self
 
 
+class EventPreviewIn(BaseModel):
+    """Request body for ``POST /events/preview`` (read-only scenario preview)."""
+
+    base_revision: int = Field(
+        ge=0,
+        description="Baseline revision the drafts are applied on top of; "
+        "0 means the empty ledger.",
+    )
+    events: List[EventIn] = Field(
+        min_length=1,
+        max_length=100,
+        description="Draft events applied in array order on top of the "
+        "baseline; fields as in POST /events.",
+    )
+
+    @model_validator(mode="after")
+    def _unique_event_ids(self) -> "EventPreviewIn":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for ev in self.events:
+            if ev.event_id in seen and ev.event_id not in duplicates:
+                duplicates.append(ev.event_id)
+            seen.add(ev.event_id)
+        if duplicates:
+            raise ValueError(
+                "event_id values must be unique within the batch; "
+                f"duplicates: {duplicates}"
+            )
+        return self
+
+
 class EventOut(BaseModel):
     event_id: str
     participant_id: str
@@ -254,3 +285,27 @@ class RewardWinnerOut(BaseModel):
 class RewardPreviewOut(BaseModel):
     revision: int
     winners: List[RewardWinnerOut]
+
+
+class EventPreviewOut(BaseModel):
+    """Response of ``POST /events/preview``: projection plus baseline diff."""
+
+    base_revision: int = Field(
+        description="Baseline revision the projection was built on; "
+        "0 means the empty ledger."
+    )
+    projected_leaderboard: LeaderboardOut = Field(
+        description=(
+            "Leaderboard as if the drafts were appended after base_revision. "
+            "Its revision is virtual (base_revision + number of drafts): no "
+            "real revision is consumed. Draft events carry their virtual "
+            "revisions in effective_events."
+        )
+    )
+    changes: List[LeaderboardChangeOut] = Field(
+        description=(
+            "Rank/points diffs between the baseline snapshot and the "
+            "projection; same item shape and participant_id ordering as "
+            "GET /leaderboard/changes."
+        )
+    )
