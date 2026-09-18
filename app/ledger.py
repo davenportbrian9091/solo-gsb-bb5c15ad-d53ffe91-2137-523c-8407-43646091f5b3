@@ -24,6 +24,8 @@ from .schemas import (
     EventChangesOut,
     EventIn,
     EventOut,
+    EventPreviewIn,
+    EventPreviewOut,
     LeaderboardChangeOut,
     LeaderboardChangesOut,
     LeaderboardEntry,
@@ -270,6 +272,196 @@ def create_events(batch: EventBatchIn) -> Tuple[list[EventOut], bool]:
         return results, True
 
 
+class _ProjectedRow:
+    """Minimal row adapter exposing the keys ``_aggregate`` indexes.
+
+    Draft events never touch the database; this carries their fields in the
+    shape of a ``sqlite3.Row`` (key access) so the shared aggregation and
+    effective-event rules apply unchanged.
+    """
+
+    __slots__ = ("event_id", "participant_id", "points", "revision", "correction_of")
+
+    def __init__(
+        self,
+        event_id: str,
+        participant_id: str,
+        points: int,
+        revision: int,
+        correction_of: Optional[str],
+    ):
+        self.event_id = event_id
+        self.participant_id = participant_id
+        self.points = points
+        self.revision = revision
+        self.correction_of = correction_of
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+
+def events_preview(preview: EventPreviewIn) -> EventPreviewOut:
+    """Project draft events on top of a baseline snapshot, read-only.
+
+    Only events visible at ``base_revision`` form the baseline (``0`` denotes
+    the empty ledger); the drafts take effect in array order, each assigned a
+    *virtual* revision ``base_revision + 1 + i``. The effective-event rule,
+    ordering, correction-fork handling and tied-rank numbering are exactly
+    those of ``/leaderboard``. Nothing is written and no real revision is
+    consumed.
+
+    Validation order:
+      * ``base_revision`` beyond the current maximum -> 404;
+      * a draft ``event_id`` clashing with any event already stored in the
+        ledger (regardless of its revision) -> 409;
+      * a duplicate within the draft batch (rejected at the schema), a
+        self-reference, or a ``correction_of`` pointing at an event that is
+        neither visible at the baseline nor an earlier draft -> 422.
+    """
+    base_revision = preview.base_revision
+    drafts = preview.events
+
+    with read_tx() as conn:
+        max_rev = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM events"
+        ).fetchone()[0]
+        if base_revision > max_rev:
+            raise HTTPException(
+                status_code=404, detail=f"revision {base_revision} not found"
+            )
+
+        # Clashes with the persisted ledger win over reference validation,
+        # mirroring POST /events/batch; events beyond the baseline still clash.
+        if drafts:
+            stored_rows = conn.execute(
+                "SELECT event_id FROM events WHERE event_id IN (%s)"
+                % ",".join("?" for _ in drafts),
+                [ev.event_id for ev in drafts],
+            ).fetchall()
+            if stored_rows:
+                clash = stored_rows[0]["event_id"]
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"draft event_id '{clash}' already exists in the ledger; "
+                        "previews cannot reuse stored event_ids"
+                    ),
+                )
+
+        before_map = _snapshot(conn, base_revision)
+        if base_revision == 0:
+            baseline_rows: list[sqlite3.Row] = []
+            baseline_ids: set[str] = set()
+        else:
+            baseline_rows = list(_effective_rows(conn, base_revision))
+            # References may target ANY event existing at the baseline,
+            # including already-superseded ones (a draft correcting such an
+            # event forks its chain), so visibility covers all revisions
+            # <= base, not just the effective rows above.
+            baseline_ids = {
+                r["event_id"]
+                for r in conn.execute(
+                    "SELECT event_id FROM events WHERE revision <= ?",
+                    (base_revision,),
+                ).fetchall()
+            }
+
+    # All references must resolve to a baseline-visible event or an earlier
+    # draft; referencing a later draft, self or an unknown id fails with 422.
+    draft_index = {ev.event_id: i for i, ev in enumerate(drafts)}
+    for i, ev in enumerate(drafts):
+        target = ev.correction_of
+        if target is None:
+            continue
+        if target == ev.event_id:
+            raise HTTPException(
+                status_code=422, detail="correction_of must not equal event_id"
+            )
+        target_idx = draft_index.get(target)
+        if target_idx is not None:
+            if target_idx >= i:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"draft event '{ev.event_id}' has correction_of "
+                        f"'{target}' referencing a later draft event; only "
+                        "earlier draft events may be referenced"
+                    ),
+                )
+        elif base_revision != 0 and target not in baseline_ids:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"correction_of references event '{target}' that is not "
+                    f"visible at base_revision {base_revision}"
+                ),
+            )
+
+    projected_revision = base_revision + len(drafts)
+    projected_rows: list[_ProjectedRow] = [
+        _ProjectedRow(r["event_id"], r["participant_id"], r["points"],
+                      r["revision"], r["correction_of"])
+        for r in baseline_rows
+    ]
+    for i, ev in enumerate(drafts):
+        projected_rows.append(
+            _ProjectedRow(
+                ev.event_id,
+                ev.participant_id,
+                ev.points,
+                base_revision + 1 + i,
+                ev.correction_of,
+            )
+        )
+
+    # The same effective rule as /leaderboard: every event with a correction
+    # among the projected set is superseded (first correction wins, matching
+    # the SQL NOT EXISTS semantics of _effective_rows).
+    superseded = {
+        ev.correction_of for ev in projected_rows if ev.correction_of is not None
+    }
+    effective_rows = [r for r in projected_rows if r["event_id"] not in superseded]
+    effective_rows.sort(key=lambda r: (r["participant_id"], r["revision"]))
+
+    ordered, details = _aggregate(effective_rows)
+    entries = [
+        LeaderboardEntry(
+            rank=i + 1,
+            participant_id=pid,
+            total_points=total,
+            effective_events=details[pid],
+        )
+        for i, (pid, total) in enumerate(ordered)
+    ]
+    projected = LeaderboardOut(revision=projected_revision, entries=entries)
+
+    after_map = {
+        e.participant_id: RankPosition(rank=e.rank, total_points=e.total_points)
+        for e in entries
+    }
+    changes: list[LeaderboardChangeOut] = []
+    for pid in sorted(set(before_map) | set(after_map)):
+        before = before_map.get(pid)
+        after = after_map.get(pid)
+        before_total = before.total_points if before is not None else 0
+        after_total = after.total_points if after is not None else 0
+        if before != after:
+            changes.append(
+                LeaderboardChangeOut(
+                    participant_id=pid,
+                    before=before,
+                    after=after,
+                    points_delta=after_total - before_total,
+                )
+            )
+
+    return EventPreviewOut(
+        base_revision=base_revision,
+        projected_leaderboard=projected,
+        changes=changes,
+    )
+
+
 def get_event(event_id: str) -> EventOut:
     with read_tx() as conn:
         row = conn.execute(
@@ -278,7 +470,6 @@ def get_event(event_id: str) -> EventOut:
     if row is None:
         raise HTTPException(status_code=404, detail=f"event '{event_id}' not found")
     return _row_to_event(row)
-
 
 def list_events() -> list[EventOut]:
     with read_tx() as conn:

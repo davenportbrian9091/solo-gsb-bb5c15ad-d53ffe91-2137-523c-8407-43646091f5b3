@@ -254,3 +254,47 @@ class RewardWinnerOut(BaseModel):
 class RewardPreviewOut(BaseModel):
     revision: int
     winners: List[RewardWinnerOut]
+
+
+class EventPreviewIn(BaseModel):
+    """Request body for ``POST /events/preview`` (read-only dry run)."""
+
+    base_revision: int = Field(
+        ge=0,
+        description="Baseline snapshot revision; 0 means the empty ledger. "
+        "Only events visible at this revision form the baseline.",
+    )
+    events: List[EventIn] = Field(
+        min_length=1,
+        max_length=100,
+        description="Draft events applied on top of the baseline in array order.",
+    )
+
+    @model_validator(mode="after")
+    def _unique_event_ids(self) -> "EventPreviewIn":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for ev in self.events:
+            if ev.event_id in seen and ev.event_id not in duplicates:
+                duplicates.append(ev.event_id)
+            seen.add(ev.event_id)
+        if duplicates:
+            raise ValueError(
+                "event_id values must be unique within the draft batch; "
+                f"duplicates: {duplicates}"
+            )
+        return self
+
+
+class EventPreviewOut(BaseModel):
+    """Response for ``POST /events/preview``; nothing is persisted."""
+
+    base_revision: int = Field(description="Baseline snapshot revision from the request.")
+    projected_leaderboard: LeaderboardOut = Field(
+        description="Leaderboard after the drafts take effect; its revision is the "
+        "virtual base_revision + len(events) and is never persisted."
+    )
+    changes: List[LeaderboardChangeOut] = Field(
+        description="Participants whose rank or total differs from the baseline, "
+        "ordered by participant_id."
+    )

@@ -13,6 +13,8 @@ from .schemas import (
     EventChangesOut,
     EventIn,
     EventOut,
+    EventPreviewIn,
+    EventPreviewOut,
     LeaderboardChangesOut,
     LeaderboardOut,
     LeaderboardPageOut,
@@ -98,6 +100,20 @@ def post_events_batch(batch: EventBatchIn, response: Response) -> List[EventOut]
 @app.get("/events", response_model=List[EventOut])
 def get_events() -> List[EventOut]:
     return ledger.list_events()
+
+
+@app.post(
+    "/events/preview",
+    response_model=EventPreviewOut,
+    responses={
+        404: {"description": "base_revision beyond the current maximum"},
+        409: {"description": "A draft event_id already exists in the ledger"},
+        422: {"description": "Invalid batch size/fields, duplicate draft event_id, "
+                              "self-reference, or an illegal correction_of target"},
+    },
+)
+def post_events_preview(preview: EventPreviewIn) -> EventPreviewOut:
+    return ledger.events_preview(preview)
 
 
 # NOTE: declared before /events/{event_id} so the literal path wins.
